@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
@@ -48,10 +49,7 @@ var upgrader = websocket.Upgrader{} // use default options
 var rooms map[int]room
 
 func socketHandler(w http.ResponseWriter, r *http.Request) {
-
-	fmt.Printf("socketHandler")
-
-	// should not be always true
+	// should not be always true !!!!
 	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
 
 	// Upgrade our raw HTTP connection to a websocket based one
@@ -62,17 +60,19 @@ func socketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	conns = append(conns, conn)
+	{
+		mu.Lock()
+		conns = append(conns, conn)
+		mu.Unlock()
+	}
 
 	// The event loop
 	for {
-		messageType, message, err := conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			log.Println("Error during message reading:", err)
 			break
 		}
-
-		fmt.Println("message type", messageType)
 
 		var action string
 		_, err = fmt.Sscan(string(message), &action)
@@ -108,7 +108,7 @@ func socketHandler(w http.ResponseWriter, r *http.Request) {
 		case "send":
 			var userId, channelId int
 			var text string
-			_, err = fmt.Sscan(string(message), &action, &channelId, &userId, text)
+			_, err = fmt.Sscan(string(message), &action, &channelId, &userId, &text)
 			if err != nil {
 				fmt.Println("Incorrect params of command", string(message))
 				continue
@@ -116,23 +116,8 @@ func socketHandler(w http.ResponseWriter, r *http.Request) {
 			messegeReceived <- roomMessage{roomId: channelId, userId: userId, text: text}
 
 		}
-
-		/*
-			log.Printf("Received: %s", message)
-			err = conn.WriteMessage(messageType, message)
-			if err != nil {
-				log.Println("Error during message writing:", err)
-				break
-			}
-		*/
 	}
 }
-
-/*
-func home(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Index Page")
-}
-*/
 
 var roomCreated chan int
 var userJoined chan roomAction
@@ -141,13 +126,18 @@ var messegeReceived chan roomMessage
 
 var conns []*websocket.Conn
 
+var mu sync.Mutex
+var roomMu sync.Mutex
+
 func sendMessage(message string) {
+	mu.Lock()
 	for _, c := range conns {
 		err := c.WriteMessage(1, []byte(message))
 		if err != nil {
 			fmt.Println("error when sending message", err)
 		}
 	}
+	mu.Unlock()
 }
 
 func main() {
@@ -166,13 +156,18 @@ func main() {
 				break
 			}
 
-			_, ok := rooms[roomId]
-			if ok {
-				fmt.Println("Room already exists", roomId)
-				continue
-			}
+			{
+				roomMu.Lock()
+				_, ok := rooms[roomId]
+				if ok {
+					fmt.Println("Room already exists", roomId)
+					roomMu.Unlock()
+					continue
+				}
 
-			rooms[roomId] = NewRoom(roomId)
+				rooms[roomId] = NewRoom(roomId)
+				roomMu.Unlock()
+			}
 			// each iteration probably should be placed in seperate goroutine
 			sendMessage(fmt.Sprintln("created", roomId))
 		}
@@ -185,21 +180,90 @@ func main() {
 				break
 			}
 
-			_, ok := rooms[a.roomId]
-			if !ok {
-				fmt.Println("No such room", a.roomId)
-				continue
-			}
+			{
+				roomMu.Lock()
+				_, ok := rooms[a.roomId]
+				if !ok {
+					fmt.Println("No such room", a.roomId)
+					roomMu.Unlock()
+					continue
+				}
 
-			room := rooms[a.roomId]
-			room.users[a.userId] = true
+				room := rooms[a.roomId]
+				room.users[a.userId] = true
+				roomMu.Unlock()
+			}
 
 			// each iteration probably should be placed in seperate goroutine/channel
 			sendMessage(fmt.Sprintln("joined", a.roomId, a.userId))
 		}
 	}()
 
+	go func() {
+		for {
+			a, opened := <-userLeft
+			if !opened {
+				break
+			}
+
+			{
+				roomMu.Lock()
+				_, ok := rooms[a.roomId]
+				if !ok {
+					fmt.Println("No such room", a.roomId)
+					roomMu.Unlock()
+					continue
+				}
+
+				room := rooms[a.roomId]
+				_, ok = room.users[a.userId]
+				{
+					if !ok {
+						fmt.Println("User not in the channel", a.roomId)
+						roomMu.Unlock()
+						continue
+					}
+				}
+
+				delete(room.users, a.userId)
+				roomMu.Unlock()
+			}
+
+			// each iteration probably should be placed in seperate goroutine/channel
+			sendMessage(fmt.Sprintln("left", a.roomId, a.userId))
+		}
+	}()
+	go func() {
+		for {
+			m, opened := <-messegeReceived
+			if !opened {
+				break
+			}
+
+			{
+				roomMu.Lock()
+				_, ok := rooms[m.roomId]
+				if !ok {
+					fmt.Println("No such room", m.roomId)
+					roomMu.Unlock()
+					continue
+				}
+
+				room := rooms[m.roomId]
+				_, ok = room.users[m.userId]
+				if !ok {
+					fmt.Println("No such user in room", m.roomId)
+					roomMu.Unlock()
+					continue
+				}
+				roomMu.Unlock()
+			}
+
+			// each iteration probably should be placed in seperate goroutine/channel
+			sendMessage(fmt.Sprintln("sent", m.roomId, m.userId, m.text))
+		}
+	}()
+
 	http.HandleFunc("/socket", socketHandler)
-	//	http.HandleFunc("/", home)
 	log.Fatal(http.ListenAndServe("localhost:8080", nil))
 }
