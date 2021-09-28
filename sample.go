@@ -10,8 +10,14 @@ import (
 )
 
 type room struct {
-	id int
-	//	users []int
+	id    int
+	users map[int]bool
+}
+
+func NewRoom(id int) room {
+	r := room{id: id}
+	r.users = make(map[int]bool)
+	return r
 }
 
 /*
@@ -80,16 +86,16 @@ func socketHandler(w http.ResponseWriter, r *http.Request) {
 			var channelId int
 			_, err = fmt.Sscan(string(message), &action, &channelId)
 			if err != nil {
-				fmt.Println("Incorrect params of command", message)
+				fmt.Println("Incorrect params of command", string(message))
 				continue
 			}
 			roomCreated <- channelId
 
 		case "join", "leave":
 			var userId, channelId int
-			_, err = fmt.Sscan(string(message), &channelId, &userId)
+			_, err = fmt.Sscan(string(message), &action, &channelId, &userId)
 			if err != nil {
-				fmt.Println("Incorrect params of command", message)
+				fmt.Println("Incorrect params of command", string(message))
 				continue
 			}
 
@@ -102,9 +108,9 @@ func socketHandler(w http.ResponseWriter, r *http.Request) {
 		case "send":
 			var userId, channelId int
 			var text string
-			_, err = fmt.Sscan(string(message), &channelId, &userId, text)
+			_, err = fmt.Sscan(string(message), &action, &channelId, &userId, text)
 			if err != nil {
-				fmt.Println("Incorrect params of command", message)
+				fmt.Println("Incorrect params of command", string(message))
 				continue
 			}
 			messegeReceived <- roomMessage{roomId: channelId, userId: userId, text: text}
@@ -122,15 +128,27 @@ func socketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+/*
 func home(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Index Page")
 }
+*/
 
 var roomCreated chan int
 var userJoined chan roomAction
 var userLeft chan roomAction
 var messegeReceived chan roomMessage
+
 var conns []*websocket.Conn
+
+func sendMessage(message string) {
+	for _, c := range conns {
+		err := c.WriteMessage(1, []byte(message))
+		if err != nil {
+			fmt.Println("error when sending message", err)
+		}
+	}
+}
 
 func main() {
 
@@ -147,20 +165,41 @@ func main() {
 			if !opened {
 				break
 			}
-			rooms[roomId] = room{id: roomId}
 
-			// each iteration probably should be placed in seperate goroutine
-			message := fmt.Sprintln("created", roomId)
-			for _, c := range conns {
-				err := c.WriteMessage(1, []byte(message))
-				if err != nil {
-					fmt.Println("error when sending message", err)
-				}
+			_, ok := rooms[roomId]
+			if ok {
+				fmt.Println("Room already exists", roomId)
+				continue
 			}
+
+			rooms[roomId] = NewRoom(roomId)
+			// each iteration probably should be placed in seperate goroutine
+			sendMessage(fmt.Sprintln("created", roomId))
+		}
+	}()
+
+	go func() {
+		for {
+			a, opened := <-userJoined
+			if !opened {
+				break
+			}
+
+			_, ok := rooms[a.roomId]
+			if !ok {
+				fmt.Println("No such room", a.roomId)
+				continue
+			}
+
+			room := rooms[a.roomId]
+			room.users[a.userId] = true
+
+			// each iteration probably should be placed in seperate goroutine/channel
+			sendMessage(fmt.Sprintln("joined", a.roomId, a.userId))
 		}
 	}()
 
 	http.HandleFunc("/socket", socketHandler)
-	http.HandleFunc("/", home)
+	//	http.HandleFunc("/", home)
 	log.Fatal(http.ListenAndServe("localhost:8080", nil))
 }
